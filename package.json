@@ -1,36 +1,73 @@
 {
   "name": "quo-linux",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Unofficial Electron wrapper for Quo (my.quo.com) on Linux",
   "main": "main.js",
-  "homepage": "https://www.quo.com",
+  "desktopName": "quo-linux.desktop",
+  "homepage": "https://github.com/codyborders/quo-linux",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/codyborders/quo-linux.git"
+  },
   "scripts": {
     "postinstall": "bash scripts/fetch-icon.sh",
     "start": "electron .",
-    "dist": "electron-builder"
+    "test": "node --test",
+    "check": "node --check main.js && node --check lib/*.js && bash -n scripts/fetch-icon.sh",
+    "dist": "electron-builder --linux"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   },
   "author": "Matt Waldrop",
   "license": "MIT",
   "private": true,
   "devDependencies": {
-    "electron": "^31.0.0",
-    "electron-builder": "^24.13.0"
+    "electron": "43.4.1",
+    "electron-builder": "26.15.3"
   },
   "build": {
-    "appId": "com.waldroplawfirm.quo-linux",
+    "appId": "com.github.codyborders.quo-linux",
     "productName": "Quo",
+    "asar": true,
     "directories": {
       "output": "release"
     },
     "files": [
       "main.js",
+      "lib/**/*.js",
+      "build/icon.png",
+      "LICENSE",
       "package.json"
     ],
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb",
+        "pacman"
+      ],
       "icon": "build/icon.png",
       "category": "Network",
-      "maintainer": "mattw@waldroplawfirm.com"
+      "maintainer": "codyborders <16085793+codyborders@users.noreply.github.com>",
+      "synopsis": "Unofficial Quo desktop client for Linux",
+      "syncDesktopName": true,
+      "vendor": "codyborders"
+    },
+    "pacman": {
+      "depends": [
+        "alsa-lib",
+        "at-spi2-core",
+        "gtk3",
+        "libcups",
+        "libnotify",
+        "libpulse",
+        "libsecret",
+        "libxkbcommon",
+        "libxss",
+        "mesa",
+        "nss",
+        "xdg-utils"
+      ]
     }
   }
 }

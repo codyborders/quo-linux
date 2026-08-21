@@ -1,77 +1,131 @@
-const { app, BrowserWindow, Tray, Menu, shell, session, nativeImage, powerMonitor } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  nativeImage,
+  powerMonitor,
+  screen,
+  session,
+  shell,
+  Tray,
+} = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { hasUnsafeSandboxFlag } = require('./lib/security-policy');
+const {
+  installPermissionPolicy,
+  installWebContentsPolicy,
+} = require('./lib/web-contents-policy');
+const { createRetryController } = require('./lib/recovery-controller');
+const { createRecoveryLogger } = require('./lib/recovery-log');
+const {
+  createDebouncedStateSaver,
+  createWindowStateStore,
+} = require('./lib/window-state');
 
 const QUO_URL = 'https://my.quo.com';
-const ALLOWED_HOSTS = ['quo.com', 'openphone.com', 'openphoneapi.com'];
-const isAllowedHost = (url) => ALLOWED_HOSTS.some((host) => url.includes(host));
 const ICON_PATH = path.join(__dirname, 'build', 'icon.png');
 const STATE_PATH = path.join(app.getPath('userData'), 'window-state.json');
 const LOG_PATH = path.join(app.getPath('userData'), 'recovery.log');
 
 let mainWindow;
+let crashRecoveryController;
+let networkRetryController;
 let tray;
+let windowStateSaver;
 let isQuitting = false;
+let shutdownInProgress = false;
+let shutdownReady = false;
 
-// Always-on (not gated by QUO_DEBUG) so a white-screen recurrence leaves a trail
-// even if nobody was running with debug logging at the time.
-function logRecoveryEvent(message) {
-  const line = `${new Date().toISOString()} ${message}\n`;
-  if (process.env.QUO_DEBUG) console.log(line.trim());
-  fs.appendFile(LOG_PATH, line, () => {});
+const recoveryLogger = createRecoveryLogger({
+  filePath: LOG_PATH,
+  fileSystem: fs.promises,
+  maxBytes: 256 * 1024,
+  now: () => new Date(),
+  onError: (error) => console.error('Failed to write recovery log:', error),
+});
+const windowStateStore = createWindowStateStore({
+  filePath: STATE_PATH,
+  fileSystem: fs.promises,
+  processId: process.pid,
+});
+
+app.on('web-contents-created', (event, webContents) => {
+  installWebContentsPolicy({
+    onError: (error) => console.error('Failed to open external URL:', error),
+    openExternal: (url) => shell.openExternal(url),
+    webContents,
+  });
+});
+
+function logRecoveryEvent(details) {
+  if (process.env.QUO_DEBUG) console.log('[recovery]', details.event);
+  return recoveryLogger.log(details);
 }
 
-function loadWindowState() {
-  try {
-    return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
-  } catch {
-    return { width: 1280, height: 860 };
-  }
+function loadQuo() {
+  if (!mainWindow || mainWindow.isDestroyed()) return Promise.resolve();
+  return mainWindow.loadURL(QUO_URL).catch(() =>
+    logRecoveryEvent({ event: 'load-url-failed', url: QUO_URL })
+  );
 }
 
-function saveWindowState() {
-  if (!mainWindow) return;
-  const bounds = mainWindow.getBounds();
-  fs.writeFileSync(STATE_PATH, JSON.stringify(bounds));
-}
-
-function createWindow() {
-  const state = loadWindowState();
+async function createWindow() {
+  const workAreas = screen.getAllDisplays().map((display) => display.workArea);
+  const state = await windowStateStore.load(workAreas);
 
   mainWindow = new BrowserWindow({
     ...state,
     icon: ICON_PATH,
     title: 'Quo',
     webPreferences: {
+      allowRunningInsecureContent: false,
       contextIsolation: true,
+      nodeIntegration: false,
       sandbox: true,
+      webSecurity: true,
     },
   });
 
-  mainWindow.loadURL(QUO_URL);
+  crashRecoveryController = createRetryController({
+    clearTimer: clearTimeout,
+    delaysMs: [1000, 2000, 5000],
+    reload: loadQuo,
+    setTimer: setTimeout,
+    stableMs: 60000,
+  });
+  networkRetryController = createRetryController({
+    clearTimer: clearTimeout,
+    delaysMs: [2000, 4000, 8000, 16000, 30000],
+    reload: loadQuo,
+    setTimer: setTimeout,
+    stableMs: 30000,
+  });
+  loadQuo();
 
-  // A failed load (e.g. autostart racing network-up, a flaky connection) otherwise
-  // leaves the window white forever with nothing to recover it. Retry with backoff.
-  let retryDelay = 2000;
   mainWindow.webContents.on('did-finish-load', () => {
-    retryDelay = 2000;
+    crashRecoveryController.markLoaded();
+    networkRetryController.markLoaded();
   });
-  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, url, isMainFrame) => {
-    if (!isMainFrame || errorCode === -3) return; // -3 = ERR_ABORTED, e.g. a superseded navigation
-    logRecoveryEvent(`did-fail-load ${errorCode} ${errorDescription} ${url}, retrying in ${retryDelay}ms`);
-    setTimeout(() => {
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(QUO_URL);
-    }, retryDelay);
-    retryDelay = Math.min(retryDelay * 2, 30000);
-  });
-
-  // Recover from a crashed/killed renderer instead of leaving a dead white window.
-  mainWindow.webContents.on('render-process-gone', (event, details) => {
-    if (details.reason === 'clean-exit') return;
-    logRecoveryEvent(`render-process-gone ${details.reason}, reloading`);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.loadURL(QUO_URL);
+  mainWindow.webContents.on(
+    'did-fail-load',
+    (event, errorCode, errorDescription, url, isMainFrame) => {
+      if (!isMainFrame || errorCode === -3) return;
+      networkRetryController.scheduleRetry();
+      logRecoveryEvent({ errorCode, event: 'did-fail-load', url });
     }
+  );
+
+  mainWindow.webContents.on('render-process-gone', (event, details) => {
+    if (isQuitting || details.reason === 'clean-exit') return;
+    const recovery = crashRecoveryController.scheduleRetry();
+    logRecoveryEvent({
+      attempt: recovery.attempt,
+      delayMs: recovery.delayMs,
+      event: 'render-process-gone',
+      reason: details.reason,
+      url: QUO_URL,
+    });
   });
 
   if (process.env.QUO_DEBUG) {
@@ -81,32 +135,22 @@ function createWindow() {
     });
   }
 
-  // Keep Quo itself inside the window; send everything else to the system browser.
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (process.env.QUO_DEBUG) console.log(`[window-open] ${url}`);
-    if (!isAllowedHost(url)) {
-      shell.openExternal(url);
-      return { action: 'deny' };
-    }
-    return { action: 'allow' };
+  windowStateSaver = createDebouncedStateSaver({
+    clearTimer: clearTimeout,
+    delayMs: 300,
+    getBounds: () => mainWindow.getBounds(),
+    onError: (error) => console.error('Failed to save window state:', error),
+    save: (bounds) => windowStateStore.save(bounds),
+    setTimer: setTimeout,
   });
-
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (process.env.QUO_DEBUG) console.log(`[will-navigate] ${url}`);
-    if (!isAllowedHost(url)) {
-      event.preventDefault();
-      shell.openExternal(url);
-    }
-  });
-
-  mainWindow.on('resize', saveWindowState);
-  mainWindow.on('move', saveWindowState);
+  mainWindow.on('resize', () => windowStateSaver.schedule());
+  mainWindow.on('move', () => windowStateSaver.schedule());
 
   // Chromium's compositor can leave a stale/blank frame after the window sits
   // hidden (tray) or the system suspends; a forced repaint is cheap and fixes it
   // without a full reload.
   mainWindow.on('show', () => {
-    logRecoveryEvent('window shown, forcing repaint');
+    logRecoveryEvent({ event: 'window-shown', url: QUO_URL });
     mainWindow.webContents.invalidate();
   });
 
@@ -146,47 +190,66 @@ function createTray() {
   });
 }
 
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
-  app.quit();
+if (hasUnsafeSandboxFlag(process.argv)) {
+  console.error('Quo refuses to start without the Chromium sandbox.');
+  app.exit(1);
 } else {
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
-      mainWindow.focus();
-    }
-  });
-
-  app.whenReady().then(() => {
-    // Calls need mic (and optionally camera) access; auto-approve for Quo's own origin only.
-    session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-      const url = webContents.getURL();
-      const allowed = ['media', 'notifications', 'clipboard-sanitized-write'];
-      if (url.startsWith(QUO_URL) && allowed.includes(permission)) {
-        callback(true);
-      } else {
-        callback(false);
+  const gotLock = app.requestSingleInstanceLock();
+  if (!gotLock) {
+    app.quit();
+  } else {
+    app.on('second-instance', () => {
+      if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
       }
     });
 
-    createWindow();
-    createTray();
+    app
+      .whenReady()
+      .then(async () => {
+        installPermissionPolicy(session.defaultSession);
 
-    powerMonitor.on('resume', () => {
-      if (!mainWindow || mainWindow.isDestroyed()) return;
-      if (mainWindow.isVisible()) {
-        logRecoveryEvent('system resumed, forcing repaint');
-        mainWindow.webContents.invalidate();
-      }
+        await createWindow();
+        createTray();
+
+        powerMonitor.on('resume', () => {
+          if (!mainWindow || mainWindow.isDestroyed()) return;
+          if (mainWindow.isVisible()) {
+            logRecoveryEvent({ event: 'system-resumed', url: QUO_URL });
+            mainWindow.webContents.invalidate();
+          }
+        });
+      })
+      .catch((error) => {
+        console.error('Failed to start Quo:', error);
+        app.quit();
+      });
+
+    app.on('before-quit', (event) => {
+      isQuitting = true;
+      crashRecoveryController?.stop();
+      networkRetryController?.stop();
+      if (shutdownReady) return;
+
+      event.preventDefault();
+      if (shutdownInProgress) return;
+      shutdownInProgress = true;
+
+      Promise.all([
+        windowStateSaver?.flush() || Promise.resolve(),
+        recoveryLogger.flush(),
+      ])
+        .catch((error) => console.error('Failed to flush application state:', error))
+        .finally(() => {
+          shutdownReady = true;
+          app.quit();
+        });
     });
-  });
 
-  app.on('before-quit', () => {
-    isQuitting = true;
-  });
-
-  app.on('window-all-closed', () => {
-    // Tray keeps the app alive; do nothing here.
-  });
+    app.on('window-all-closed', () => {
+      // Tray keeps the app alive; do nothing here.
+    });
+  }
 }

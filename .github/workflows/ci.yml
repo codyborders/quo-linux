@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          node-version: 22
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm audit --audit-level=high
+
+  package-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          node-version: 22
+      - run: sudo apt-get update && sudo apt-get install --yes libarchive-tools xz-utils
+      - run: npm ci
+      - run: npm run dist -- --x64 --publish never
+      - name: Check packaged resources
+        run: |
+          set -euo pipefail
+          archive=release/linux-unpacked/resources/app.asar
+          ./node_modules/.bin/asar list "$archive" > /tmp/asar-files.txt
+          for file in /LICENSE /build/icon.png /lib/security-policy.js /main.js /package.json; do
+            grep -Fx "$file" /tmp/asar-files.txt
+          done
+      - name: Check AppImage launcher
+        run: |
+          set -euo pipefail
+          appimage="$(find release -maxdepth 1 -name '*.AppImage' -print -quit)"
+          chmod +x "$appimage"
+          cd "$(mktemp -d)"
+          "$GITHUB_WORKSPACE/$appimage" --appimage-extract AppRun >/dev/null
+          ! grep -F '${APPDIR}/usr/lib:${LD_LIBRARY_PATH}' squashfs-root/AppRun
+      - name: Check Arch package metadata
+        run: |
+          set -euo pipefail
+          package="$(find release -maxdepth 1 -name '*.pacman' -print -quit)"
+          bsdtar -xOf "$package" .PKGINFO > /tmp/PKGINFO
+          grep -Fx 'depend = gtk3' /tmp/PKGINFO
+          grep -Fx 'depend = libpulse' /tmp/PKGINFO
+          ! grep -Eq 'http-parser|libappindicator-gtk3' /tmp/PKGINFO
+      - name: Write checksums
+        run: sha256sum release/*.AppImage release/*.deb release/*.pacman > release/SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quo-linux-x64
+          if-no-files-found: error
+          path: |
+            release/*.AppImage
+            release/*.deb
+            release/*.pacman
+            release/SHA256SUMS
